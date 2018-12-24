@@ -1,101 +1,28 @@
 import os
 import tempfile
+import time
 
-import tensorflow as tf
-import zipfile
-import cloudpickle
 import numpy as np
 
-import baselines.common.tf_util as U
-from baselines.common.tf_util import load_variables, save_variables
 from baselines import logger
 from baselines.common.schedules import LinearSchedule
 from baselines.common import set_global_seeds
 
-from baselines import deepq
 from baselines.deepq.replay_buffer import ReplayBuffer, PrioritizedReplayBuffer
-from baselines.deepq.utils import ObservationInput
-
-from baselines.common.tf_util import get_session
-from baselines.deepq.models import build_q_func
+from baselines.deepq.models import build_q_model
+from baselines.deepq.agent import Agent
 
 
-class ActWrapper(object):
-    def __init__(self, act, act_params):
-        self._act = act
-        self._act_params = act_params
-        self.initial_state = None
-
-    @staticmethod
-    def load_act(path):
-        with open(path, "rb") as f:
-            model_data, act_params = cloudpickle.load(f)
-        act = deepq.build_act(**act_params)
-        sess = tf.Session()
-        sess.__enter__()
-        with tempfile.TemporaryDirectory() as td:
-            arc_path = os.path.join(td, "packed.zip")
-            with open(arc_path, "wb") as f:
-                f.write(model_data)
-
-            zipfile.ZipFile(arc_path, 'r', zipfile.ZIP_DEFLATED).extractall(td)
-            load_variables(os.path.join(td, "model"))
-
-        return ActWrapper(act, act_params)
-
-    def __call__(self, *args, **kwargs):
-        return self._act(*args, **kwargs)
-
-    def step(self, observation, **kwargs):
-        # DQN doesn't use RNNs so we ignore states and masks
-        kwargs.pop('S', None)
-        kwargs.pop('M', None)
-        return self._act([observation], **kwargs), None, None, None
-
-    def save_act(self, path=None):
-        """Save model to a pickle located at `path`"""
-        if path is None:
-            path = os.path.join(logger.get_dir(), "model.pkl")
-
-        with tempfile.TemporaryDirectory() as td:
-            save_variables(os.path.join(td, "model"))
-            arc_name = os.path.join(td, "packed.zip")
-            with zipfile.ZipFile(arc_name, 'w') as zipf:
-                for root, dirs, files in os.walk(td):
-                    for fname in files:
-                        file_path = os.path.join(root, fname)
-                        if file_path != arc_name:
-                            zipf.write(file_path, os.path.relpath(file_path, td))
-            with open(arc_name, "rb") as f:
-                model_data = f.read()
-        with open(path, "wb") as f:
-            cloudpickle.dump((model_data, self._act_params), f)
-
-    def save(self, path):
-        save_variables(path)
-
-
-def load_act(path):
-    """Load act function that was returned by learn function.
-
-    Parameters
-    ----------
-    path: str
-        path to the act function pickle
-
-    Returns
-    -------
-    act: ActWrapper
-        function that takes a batch of observations
-        and returns actions.
-    """
-    return ActWrapper.load_act(path)
+import copy
+import torch
+import torch.nn.functional as F
 
 
 def learn(env,
           network,
           seed=None,
           lr=5e-4,
+          scale=255.0,
           total_timesteps=100000,
           buffer_size=50000,
           exploration_fraction=0.1,
@@ -103,6 +30,7 @@ def learn(env,
           train_freq=1,
           batch_size=32,
           print_freq=100,
+          grad_norm_clip=10,
           checkpoint_freq=10000,
           checkpoint_path=None,
           learning_starts=1000,
@@ -116,8 +44,7 @@ def learn(env,
           param_noise=False,
           callback=None,
           load_path=None,
-          **network_kwargs
-            ):
+          **network_kwargs):
     """Train a deepq model.
 
     Parameters
@@ -187,35 +114,16 @@ def learn(env,
     """
     # Create all the functions necessary to train the model
 
-    sess = get_session()
     set_global_seeds(seed)
 
-    q_func = build_q_func(network, **network_kwargs)
+    input_shape = (1, ) + env.observation_space.shape
+    actions = env.action_space.n
 
-    # capture the shape outside the closure so that the env object is not serialized
-    # by cloudpickle when serializing make_obs_ph
+    q_model = build_q_model(network, input_shape=input_shape, actions=actions, **network_kwargs)
 
-    observation_space = env.observation_space
-    def make_obs_ph(name):
-        return ObservationInput(observation_space, name=name)
+    actor = Agent(q_model, env.action_space, lr=lr, scale=scale)
 
-    act, train, update_target, debug = deepq.build_train(
-        make_obs_ph=make_obs_ph,
-        q_func=q_func,
-        num_actions=env.action_space.n,
-        optimizer=tf.train.AdamOptimizer(learning_rate=lr),
-        gamma=gamma,
-        grad_norm_clipping=10,
-        param_noise=param_noise
-    )
 
-    act_params = {
-        'make_obs_ph': make_obs_ph,
-        'q_func': q_func,
-        'num_actions': env.action_space.n,
-    }
-
-    act = ActWrapper(act, act_params)
 
     # Create the replay buffer
     if prioritized_replay:
@@ -234,8 +142,6 @@ def learn(env,
                                  final_p=exploration_final_eps)
 
     # Initialize the parameters and copy them to the target network.
-    U.initialize()
-    update_target()
 
     episode_rewards = [0.0]
     saved_mean_reward = None
@@ -245,18 +151,15 @@ def learn(env,
     with tempfile.TemporaryDirectory() as td:
         td = checkpoint_path or td
 
-        model_file = os.path.join(td, "model")
+        model_file = os.path.join(td, "model.pth")
         model_saved = False
 
-        if tf.train.latest_checkpoint(td) is not None:
-            load_variables(model_file)
+        if os.path.exists(model_file):
+            actor.load(model_file)
             logger.log('Loaded model from {}'.format(model_file))
             model_saved = True
-        elif load_path is not None:
-            load_variables(load_path)
-            logger.log('Loaded model from {}'.format(load_path))
 
-
+        now = time.time()
         for t in range(total_timesteps):
             if callback is not None:
                 if callback(locals(), globals()):
@@ -264,22 +167,26 @@ def learn(env,
             # Take action and update exploration to the newest value
             kwargs = {}
             if not param_noise:
-                update_eps = exploration.value(t)
+                epsilon = exploration.value(t)
                 update_param_noise_threshold = 0.
+                action = actor.act(obs, epsilon)
             else:
-                update_eps = 0.
                 # Compute the threshold such that the KL divergence between perturbed and non-perturbed
                 # policy is comparable to eps-greedy exploration with eps = exploration.value(t).
                 # See Appendix C.1 in Parameter Space Noise for Exploration, Plappert et al., 2017
                 # for detailed explanation.
                 update_param_noise_threshold = -np.log(1. - exploration.value(t) + exploration.value(t) / float(env.action_space.n))
-                kwargs['reset'] = reset
-                kwargs['update_param_noise_threshold'] = update_param_noise_threshold
-                kwargs['update_param_noise_scale'] = True
-            action = act(np.array(obs)[None], update_eps=update_eps, **kwargs)[0]
-            env_action = action
+
+                action = actor.act_with_param_noise(
+                    obs,
+                    update_param_noise_threshold=update_param_noise_threshold,
+                    update_param_noise_scale=True)
+
+
+
+            # action = act(np.array(obs), update_eps=update_eps, **kwargs)
             reset = False
-            new_obs, rew, done, _ = env.step(env_action)
+            new_obs, rew, done, _ = env.step(action)
             # Store transition in the replay buffer.
             replay_buffer.add(obs, action, rew, new_obs, float(done))
             obs = new_obs
@@ -294,22 +201,25 @@ def learn(env,
                 # Minimize the error in Bellman's equation on a batch sampled from replay buffer.
                 if prioritized_replay:
                     experience = replay_buffer.sample(batch_size, beta=beta_schedule.value(t))
-                    (obses_t, actions, rewards, obses_tp1, dones, weights, batch_idxes) = experience
+                    obses_t, actions, rewards, obses_tp1, dones, weights, batch_idxes = experience
                 else:
                     obses_t, actions, rewards, obses_tp1, dones = replay_buffer.sample(batch_size)
                     weights, batch_idxes = np.ones_like(rewards), None
-                td_errors = train(obses_t, actions, rewards, obses_tp1, dones, weights)
+
+                inputs = (obses_t, actions, rewards, obses_tp1, dones, weights)
+                td_errors = actor.update(inputs, double_q=True, gamma=gamma, grad_norm_clip=10)
                 if prioritized_replay:
                     new_priorities = np.abs(td_errors) + prioritized_replay_eps
                     replay_buffer.update_priorities(batch_idxes, new_priorities)
 
             if t > learning_starts and t % target_network_update_freq == 0:
                 # Update target network periodically.
-                update_target()
+                actor.sync()
 
             mean_100ep_reward = round(np.mean(episode_rewards[-101:-1]), 1)
             num_episodes = len(episode_rewards)
             if done and print_freq is not None and len(episode_rewards) % print_freq == 0:
+                logger.record_tabular("Speed", t / (time.time() - now))
                 logger.record_tabular("steps", t)
                 logger.record_tabular("episodes", num_episodes)
                 logger.record_tabular("mean 100 episode reward", mean_100ep_reward)
@@ -322,12 +232,12 @@ def learn(env,
                     if print_freq is not None:
                         logger.log("Saving model due to mean reward increase: {} -> {}".format(
                                    saved_mean_reward, mean_100ep_reward))
-                    save_variables(model_file)
+                    actor.save(model_file)
                     model_saved = True
                     saved_mean_reward = mean_100ep_reward
         if model_saved:
             if print_freq is not None:
                 logger.log("Restored model with mean reward: {}".format(saved_mean_reward))
-            load_variables(model_file)
+            actor.load(model_file)
 
-    return act
+    return actor

@@ -38,7 +38,7 @@ class NormalActionNoise(ActionNoise):
         self.mu = mu
         self.sigma = sigma
 
-    def __call__(self):
+    def noise(self):
         return np.random.normal(self.mu, self.sigma)
 
     def __repr__(self):
@@ -55,7 +55,7 @@ class OrnsteinUhlenbeckActionNoise(ActionNoise):
         self.x0 = x0
         self.reset()
 
-    def __call__(self):
+    def noise(self):
         x = self.x_prev + self.theta * (self.mu - self.x_prev) * self.dt + self.sigma * np.sqrt(self.dt) * np.random.normal(size=self.mu.shape)
         self.x_prev = x
         return x
@@ -65,3 +65,13 @@ class OrnsteinUhlenbeckActionNoise(ActionNoise):
 
     def __repr__(self):
         return 'OrnsteinUhlenbeckActionNoise(mu={}, sigma={})'.format(self.mu, self.sigma)
+
+def ddpg_distance_metric(actions1, actions2):
+    """
+    Compute "distance" between actions taken by two policies at the same states
+    Expects numpy arrays
+    """
+    diff = actions1-actions2
+    mean_diff = np.mean(np.square(diff), axis=0)
+    dist = np.sqrt(np.mean(mean_diff))
+    return dist

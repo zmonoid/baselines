@@ -46,7 +46,7 @@ class Memory(object):
         self.observations0 = RingBuffer(limit, shape=observation_shape)
         self.actions = RingBuffer(limit, shape=action_shape)
         self.rewards = RingBuffer(limit, shape=(1,))
-        self.terminals1 = RingBuffer(limit, shape=(1,))
+        self.terminals = RingBuffer(limit, shape=(1,))
         self.observations1 = RingBuffer(limit, shape=observation_shape)
 
     def sample(self, batch_size):
@@ -57,18 +57,18 @@ class Memory(object):
         obs1_batch = self.observations1.get_batch(batch_idxs)
         action_batch = self.actions.get_batch(batch_idxs)
         reward_batch = self.rewards.get_batch(batch_idxs)
-        terminal1_batch = self.terminals1.get_batch(batch_idxs)
+        terminal_batch = self.terminals.get_batch(batch_idxs)
 
         result = {
             'obs0': array_min2d(obs0_batch),
             'obs1': array_min2d(obs1_batch),
             'rewards': array_min2d(reward_batch),
             'actions': array_min2d(action_batch),
-            'terminals1': array_min2d(terminal1_batch),
+            'terminals': array_min2d(terminal_batch),
         }
         return result
 
-    def append(self, obs0, action, reward, obs1, terminal1, training=True):
+    def append(self, obs0, action, reward, obs1, terminals, training=True):
         if not training:
             return
 
@@ -76,7 +76,7 @@ class Memory(object):
         self.actions.append(action)
         self.rewards.append(reward)
         self.observations1.append(obs1)
-        self.terminals1.append(terminal1)
+        self.terminals.append(terminals)
 
     @property
     def nb_entries(self):

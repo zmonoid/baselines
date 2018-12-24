@@ -12,7 +12,7 @@ def main():
 
     model = deepq.learn(
         env,
-        "conv_only",
+        "cnn_mlp",
         convs=[(32, 8, 4), (64, 4, 2), (64, 3, 1)],
         hiddens=[256],
         dueling=True,

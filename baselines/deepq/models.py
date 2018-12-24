@@ -1,140 +1,116 @@
-import tensorflow as tf
-import tensorflow.contrib.layers as layers
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class NoiseLinear(nn.Module):
+    def __init__(self, in_size, out_size):
+        super(NoiseLinear, self).__init__()
+        self.linear = nn.Linear(in_size, out_size)
+        self.sigma = 0.0
+
+    def forward(self, x):
+        noise_w = torch.randn_like(self.linear.weight).to(x.device) * self.sigma
+        noise_b = torch.randn_like(self.linear.bias).to(x.device) * self.sigma
+        x = F.linear(x, self.linear.weight + noise_w, self.linear.bias + noise_b)
+        return x
 
 
-def _mlp(hiddens, input_, num_actions, scope, reuse=False, layer_norm=False):
-    with tf.variable_scope(scope, reuse=reuse):
-        out = input_
-        for hidden in hiddens:
-            out = layers.fully_connected(out, num_outputs=hidden, activation_fn=None)
-            if layer_norm:
-                out = layers.layer_norm(out, center=True, scale=True)
-            out = tf.nn.relu(out)
-        q_out = layers.fully_connected(out, num_outputs=num_actions, activation_fn=None)
-        return q_out
 
 
-def mlp(hiddens=[], layer_norm=False):
-    """This model takes as input an observation and returns values of all actions.
+class CNN(nn.Module):
+    def __init__(self, convs, input_channel=4):
+        super(CNN, self).__init__()
+        layers = []
+        for output_channel, kernel_size, stride in convs:
+            layers.append(nn.Conv2d(input_channel, output_channel, kernel_size, stride))
+            layers.append(nn.ReLU())
+            input_channel = output_channel
+        self.cnns = nn.Sequential(*layers)
+        self.convs = convs
 
-    Parameters
-    ----------
-    hiddens: [int]
-        list of sizes of hidden layers
-    layer_norm: bool
-        if true applies layer normalization for every layer
-        as described in https://arxiv.org/abs/1607.06450
-
-    Returns
-    -------
-    q_func: function
-        q_function for DQN algorithm.
-    """
-    return lambda *args, **kwargs: _mlp(hiddens, layer_norm=layer_norm, *args, **kwargs)
+    def forward(self, input):
+        return self.cnns(input)
 
 
-def _cnn_to_mlp(convs, hiddens, dueling, input_, num_actions, scope, reuse=False, layer_norm=False):
-    with tf.variable_scope(scope, reuse=reuse):
-        out = input_
-        with tf.variable_scope("convnet"):
-            for num_outputs, kernel_size, stride in convs:
-                out = layers.convolution2d(out,
-                                           num_outputs=num_outputs,
-                                           kernel_size=kernel_size,
-                                           stride=stride,
-                                           activation_fn=tf.nn.relu)
-        conv_out = layers.flatten(out)
-        with tf.variable_scope("action_value"):
-            action_out = conv_out
-            for hidden in hiddens:
-                action_out = layers.fully_connected(action_out, num_outputs=hidden, activation_fn=None)
-                if layer_norm:
-                    action_out = layers.layer_norm(action_out, center=True, scale=True)
-                action_out = tf.nn.relu(action_out)
-            action_scores = layers.fully_connected(action_out, num_outputs=num_actions, activation_fn=None)
+class MLP(nn.Module):
+    def __init__(self, hiddens, input_size=4, act='relu'):
+        super(MLP, self).__init__()
+        layers = []
+        for hidden_size in hiddens:
+
+            layers.append(NoiseLinear(input_size, hidden_size))
+
+            if act == 'relu':
+                layers.append(nn.ReLU())
+            else:
+                layers.append(nn.Tanh())
+
+            input_size = hidden_size
+        self.mlp = nn.Sequential(*layers)
+        self.hiddens = hiddens
+
+    def forward(self, input):
+        return self.mlp(input)
+
+
+
+class QModel(nn.Module):
+    def __init__(self, cnn, mlp, actions=4, dueling=False):
+        super(QModel, self).__init__()
+        self.cnn = cnn
+        self.mlp = mlp
+        self.dueling = dueling
+
+        self.action_head = NoiseLinear(mlp.hiddens[-1], actions)
 
         if dueling:
-            with tf.variable_scope("state_value"):
-                state_out = conv_out
-                for hidden in hiddens:
-                    state_out = layers.fully_connected(state_out, num_outputs=hidden, activation_fn=None)
-                    if layer_norm:
-                        state_out = layers.layer_norm(state_out, center=True, scale=True)
-                    state_out = tf.nn.relu(state_out)
-                state_score = layers.fully_connected(state_out, num_outputs=1, activation_fn=None)
-            action_scores_mean = tf.reduce_mean(action_scores, 1)
-            action_scores_centered = action_scores - tf.expand_dims(action_scores_mean, 1)
-            q_out = state_score + action_scores_centered
-        else:
-            q_out = action_scores
-        return q_out
+            self.state_head = NoiseLinear(mlp.hiddens[-1], 1)
+
+    def forward(self, x):
+        if self.cnn is not None:
+            x = self.cnn(x)
+        x = x.view(x.size(0), -1)
+        x = self.mlp(x)
+
+        action_score = self.action_head(x)
+
+        if self.dueling:
+            state_score = self.state_head(x)
+            action_score = action_score - action_score.mean(dim=-1, keepdim=True)
+            action_score = state_score + action_score
+
+        return action_score
+
+    def set_sigma(self, sigma):
+        for m in self.modules():
+            if isinstance(m, NoiseLinear):
+                m.sigma = sigma
+
+    def print_sigma(self):
+        for m in self.modules():
+            if isinstance(m, NoiseLinear):
+                print('sss', m.sigma)
+
+def build_q_model(network, hiddens=[256], dueling=True, input_shape=(32, 4, 84, 84), actions=4, convs=None):
+
+    if network == 'cnn_mlp':
+        batch_size, height, width, input_channel = input_shape
+        input_shape = (batch_size, input_channel, height, width)
+        var = torch.randn(*input_shape)
+        cnn = CNN(convs, input_channel)
+
+        var = cnn(var).view(var.size(0), -1)
+        mlp = MLP(hiddens, var.size(1))
+        model = QModel(cnn, mlp, actions, dueling)
+        return model
+
+    elif network == 'mlp_only':
+        batch_size, input_size = input_shape
+        mlp = MLP(hiddens, input_size, act='tanh')
+        model = QModel(None, mlp, actions, dueling)
+        return model
 
 
-def cnn_to_mlp(convs, hiddens, dueling=False, layer_norm=False):
-    """This model takes as input an observation and returns values of all actions.
+    else:
+        raise ValueError("No such model")
 
-    Parameters
-    ----------
-    convs: [(int, int, int)]
-        list of convolutional layers in form of
-        (num_outputs, kernel_size, stride)
-    hiddens: [int]
-        list of sizes of hidden layers
-    dueling: bool
-        if true double the output MLP to compute a baseline
-        for action scores
-    layer_norm: bool
-        if true applies layer normalization for every layer
-        as described in https://arxiv.org/abs/1607.06450
-
-    Returns
-    -------
-    q_func: function
-        q_function for DQN algorithm.
-    """
-
-    return lambda *args, **kwargs: _cnn_to_mlp(convs, hiddens, dueling, layer_norm=layer_norm, *args, **kwargs)
-
-
-
-def build_q_func(network, hiddens=[256], dueling=True, layer_norm=False, **network_kwargs):
-    if isinstance(network, str):
-        from baselines.common.models import get_network_builder
-        network = get_network_builder(network)(**network_kwargs)
-
-    def q_func_builder(input_placeholder, num_actions, scope, reuse=False):
-        with tf.variable_scope(scope, reuse=reuse):
-            latent = network(input_placeholder)
-            if isinstance(latent, tuple):
-                if latent[1] is not None:
-                    raise NotImplementedError("DQN is not compatible with recurrent policies yet")
-                latent = latent[0]
-
-            latent = layers.flatten(latent)
-
-            with tf.variable_scope("action_value"):
-                action_out = latent
-                for hidden in hiddens:
-                    action_out = layers.fully_connected(action_out, num_outputs=hidden, activation_fn=None)
-                    if layer_norm:
-                        action_out = layers.layer_norm(action_out, center=True, scale=True)
-                    action_out = tf.nn.relu(action_out)
-                action_scores = layers.fully_connected(action_out, num_outputs=num_actions, activation_fn=None)
-
-            if dueling:
-                with tf.variable_scope("state_value"):
-                    state_out = latent
-                    for hidden in hiddens:
-                        state_out = layers.fully_connected(state_out, num_outputs=hidden, activation_fn=None)
-                        if layer_norm:
-                            state_out = layers.layer_norm(state_out, center=True, scale=True)
-                        state_out = tf.nn.relu(state_out)
-                    state_score = layers.fully_connected(state_out, num_outputs=1, activation_fn=None)
-                action_scores_mean = tf.reduce_mean(action_scores, 1)
-                action_scores_centered = action_scores - tf.expand_dims(action_scores_mean, 1)
-                q_out = state_score + action_scores_centered
-            else:
-                q_out = action_scores
-            return q_out
-
-    return q_func_builder

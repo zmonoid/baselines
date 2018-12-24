@@ -3,12 +3,11 @@ import time
 from collections import deque
 import pickle
 
-from baselines.ddpg.ddpg_learner import DDPG
-from baselines.ddpg.models import Actor, Critic
+from baselines.ddpg.agent import Agent
+from baselines.ddpg.models import build_actor_critic
 from baselines.ddpg.memory import Memory
 from baselines.ddpg.noise import AdaptiveParamNoiseSpec, NormalActionNoise, OrnsteinUhlenbeckActionNoise
 from baselines.common import set_global_seeds
-import baselines.common.tf_util as U
 
 from baselines import logger
 import numpy as np
@@ -35,6 +34,7 @@ def learn(network, env,
           critic_lr=1e-3,
           popart=False,
           gamma=0.99,
+          scale=1.0,
           clip_norm=None,
           nb_train_steps=50, # per epoch cycle and MPI worker,
           nb_eval_steps=100,
@@ -57,12 +57,17 @@ def learn(network, env,
     else:
         rank = 0
 
+
+
     nb_actions = env.action_space.shape[-1]
     assert (np.abs(env.action_space.low) == env.action_space.high).all()  # we assume symmetric actions.
 
     memory = Memory(limit=int(1e6), action_shape=env.action_space.shape, observation_shape=env.observation_space.shape)
-    critic = Critic(network=network, **network_kwargs)
-    actor = Actor(nb_actions, network=network, **network_kwargs)
+
+    input_shape = (1, ) + env.observation_space.shape
+
+    critic = build_actor_critic(network=network, input_shape=(1, input_shape[1] + nb_actions), actions=1)
+    actor = build_actor_critic(network=network, input_shape=input_shape, actions=nb_actions, output_act='tanh')
 
     action_noise = None
     param_noise = None
@@ -86,36 +91,29 @@ def learn(network, env,
     max_action = env.action_space.high
     logger.info('scaling actions by {} before executing in env'.format(max_action))
 
-    agent = DDPG(actor, critic, memory, env.observation_space.shape, env.action_space.shape,
-        gamma=gamma, tau=tau, normalize_returns=normalize_returns, normalize_observations=normalize_observations,
+    agent = Agent(actor, critic, memory, gamma=gamma, tau=tau, normalize_returns=normalize_returns,
+        normalize_observations=normalize_observations,
         batch_size=batch_size, action_noise=action_noise, param_noise=param_noise, critic_l2_reg=critic_l2_reg,
         actor_lr=actor_lr, critic_lr=critic_lr, enable_popart=popart, clip_norm=clip_norm,
-        reward_scale=reward_scale)
+        reward_scale=reward_scale, cuda=True)
     logger.info('Using agent with the following configuration:')
     logger.info(str(agent.__dict__.items()))
 
     eval_episode_rewards_history = deque(maxlen=100)
     episode_rewards_history = deque(maxlen=100)
-    sess = U.get_session()
-    # Prepare everything.
-    agent.initialize(sess)
-    sess.graph.finalize()
 
     agent.reset()
-
     obs = env.reset()
+
     if eval_env is not None:
         eval_obs = eval_env.reset()
+
     nenvs = obs.shape[0]
 
     episode_reward = np.zeros(nenvs, dtype = np.float32) #vector
     episode_step = np.zeros(nenvs, dtype = int) # vector
     episodes = 0 #scalar
     t = 0 # scalar
-
-    epoch = 0
-
-
 
     start_time = time.time()
 
@@ -133,7 +131,7 @@ def learn(network, env,
                 agent.reset()
             for t_rollout in range(nb_rollout_steps):
                 # Predict next action.
-                action, q, _, _ = agent.step(obs, apply_noise=True, compute_Q=True)
+                action, q, _, _ = agent.step(obs)
 
                 # Execute next action.
                 if rank == 0 and render:
@@ -144,8 +142,7 @@ def learn(network, env,
                 # note these outputs are batched from vecenv
 
                 t += 1
-                if rank == 0 and render:
-                    env.render()
+
                 episode_reward += r
                 episode_step += 1
 
@@ -178,13 +175,12 @@ def learn(network, env,
             for t_train in range(nb_train_steps):
                 # Adapt param noise, if necessary.
                 if memory.nb_entries >= batch_size and t_train % param_noise_adaption_interval == 0:
-                    distance = agent.adapt_param_noise()
+                    distance = agent.adapt_actor_param_noise()
                     epoch_adaptive_distances.append(distance)
 
                 cl, al = agent.train()
                 epoch_critic_losses.append(cl)
                 epoch_actor_losses.append(al)
-                agent.update_target_net()
 
             # Evaluate.
             eval_episode_rewards = []
@@ -193,7 +189,7 @@ def learn(network, env,
                 nenvs_eval = eval_obs.shape[0]
                 eval_episode_reward = np.zeros(nenvs_eval, dtype = np.float32)
                 for t_rollout in range(nb_eval_steps):
-                    eval_action, eval_q, _, _ = agent.step(eval_obs, apply_noise=False, compute_Q=True)
+                    eval_action, eval_q, _, _ = agent.step(eval_obs)
                     eval_obs, eval_r, eval_done, eval_info = eval_env.step(max_action * eval_action)  # scale for execution in env (as far as DDPG is concerned, every action is in [-1, 1])
                     if render_eval:
                         eval_env.render()
@@ -212,6 +208,7 @@ def learn(network, env,
             mpi_size = 1
 
         # Log stats.
+
         # XXX shouldn't call np.mean on variable length lists
         duration = time.time() - start_time
         stats = agent.get_stats()
@@ -235,14 +232,7 @@ def learn(network, env,
             combined_stats['eval/return_history'] = np.mean(eval_episode_rewards_history)
             combined_stats['eval/Q'] = eval_qs
             combined_stats['eval/episodes'] = len(eval_episode_rewards)
-        def as_scalar(x):
-            if isinstance(x, np.ndarray):
-                assert x.size == 1
-                return x[0]
-            elif np.isscalar(x):
-                return x
-            else:
-                raise ValueError('expected scalar, got %s'%x)
+
 
         combined_stats_sums = np.array([ np.array(x).flatten()[0] for x in combined_stats.values()])
         if MPI is not None:
@@ -255,7 +245,8 @@ def learn(network, env,
         combined_stats['total/steps'] = t
 
         for key in sorted(combined_stats.keys()):
-            logger.record_tabular(key, combined_stats[key])
+            if not key.startswith('ref'):
+                logger.record_tabular(key, combined_stats[key])
 
         if rank == 0:
             logger.dump_tabular()

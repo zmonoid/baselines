@@ -1,51 +1,68 @@
-import tensorflow as tf
-from baselines.common.models import get_network_builder
 
 
-class Model(object):
-    def __init__(self, name, network='mlp', **network_kwargs):
-        self.name = name
-        self.network_builder = get_network_builder(network)(**network_kwargs)
 
-    @property
-    def vars(self):
-        return tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=self.name)
-
-    @property
-    def trainable_vars(self):
-        return tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope=self.name)
-
-    @property
-    def perturbable_vars(self):
-        return [var for var in self.trainable_vars if 'LayerNorm' not in var.name]
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-class Actor(Model):
-    def __init__(self, nb_actions, name='actor', network='mlp', **network_kwargs):
-        super().__init__(name=name, network=network, **network_kwargs)
-        self.nb_actions = nb_actions
+class NoiseLinear(nn.Module):
+    def __init__(self, in_size, out_size):
+        super(NoiseLinear, self).__init__()
+        self.linear = nn.Linear(in_size, out_size)
+        self.sigma = 0.0
 
-    def __call__(self, obs, reuse=False):
-        with tf.variable_scope(self.name, reuse=tf.AUTO_REUSE):
-            x = self.network_builder(obs)
-            x = tf.layers.dense(x, self.nb_actions, kernel_initializer=tf.random_uniform_initializer(minval=-3e-3, maxval=3e-3))
-            x = tf.nn.tanh(x)
+    def forward(self, x):
+        noise_w = torch.randn_like(self.linear.weight).to(x.device) * self.sigma
+        noise_b = torch.randn_like(self.linear.bias).to(x.device) * self.sigma
+        x = F.linear(x, self.linear.weight + noise_w, self.linear.bias + noise_b)
         return x
 
 
-class Critic(Model):
-    def __init__(self, name='critic', network='mlp', **network_kwargs):
-        super().__init__(name=name, network=network, **network_kwargs)
-        self.layer_norm = True
+class MLP(nn.Module):
+    def __init__(self, hiddens, input_size=4, actions=4, act='relu', output_act=None):
+        super(MLP, self).__init__()
+        layers = []
+        for hidden_size in hiddens:
 
-    def __call__(self, obs, action, reuse=False):
-        with tf.variable_scope(self.name, reuse=tf.AUTO_REUSE):
-            x = tf.concat([obs, action], axis=-1) # this assumes observation and action can be concatenated
-            x = self.network_builder(x)
-            x = tf.layers.dense(x, 1, kernel_initializer=tf.random_uniform_initializer(minval=-3e-3, maxval=3e-3), name='output')
-        return x
+            layers.append(NoiseLinear(input_size, hidden_size))
+            layers.append(nn.LayerNorm(hidden_size))
 
-    @property
-    def output_vars(self):
-        output_vars = [var for var in self.trainable_vars if 'output' in var.name]
-        return output_vars
+            if act == 'relu':
+                layers.append(nn.ReLU())
+            else:
+                layers.append(nn.Tanh())
+
+            input_size = hidden_size
+
+        layers.append(NoiseLinear(input_size, actions))
+        if output_act is not None:
+            layers.append(nn.Tanh())
+        self.mlp = nn.Sequential(*layers)
+        self.hiddens = hiddens
+
+    def forward(self, input):
+        return self.mlp(input)
+
+
+    def set_sigma(self, sigma):
+        for m in self.modules():
+            if isinstance(m, NoiseLinear):
+                m.sigma = sigma
+
+
+def build_actor_critic(network, hiddens=[64, 64], input_shape=(1, 11), actions=4, output_act=None):
+
+    if network == 'mlp_only':
+        batch_size, input_size = input_shape
+        model = MLP(hiddens, input_size, actions=actions, act='tanh', output_act=output_act)
+        return model
+
+    else:
+        raise ValueError("No such model")
+
+
+
+
+
+

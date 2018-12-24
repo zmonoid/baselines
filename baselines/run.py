@@ -55,6 +55,11 @@ def train(args, extra_args):
     env_type, env_id = get_env_type(args.env)
     print('env_type: {}'.format(env_type))
 
+    if env_type in {'retro', 'atari'}:
+        scale = 255.0
+    else:
+        scale = 1.0
+
     total_timesteps = int(args.num_timesteps)
     seed = args.seed
 
@@ -78,6 +83,7 @@ def train(args, extra_args):
         env=env,
         seed=seed,
         total_timesteps=total_timesteps,
+        scale=scale,
         **alg_kwargs
     )
 
@@ -104,11 +110,6 @@ def build_env(args):
             env = VecFrameStack(env, frame_stack_size)
 
     else:
-       config = tf.ConfigProto(allow_soft_placement=True,
-                               intra_op_parallelism_threads=1,
-                               inter_op_parallelism_threads=1)
-       config.gpu_options.allow_growth = True
-       get_session(config=config)
 
        flatten_dict_observations = alg not in {'her'}
        env = make_vec_env(env_id, env_type, args.num_env or 1, seed, reward_scale=args.reward_scale, flatten_dict_observations=flatten_dict_observations)
@@ -131,14 +132,17 @@ def get_env_type(env_id):
                 break
         assert env_type is not None, 'env_id {} is not recognized in env types'.format(env_id, _game_envs.keys())
 
+    if env_id.startswith('Roboschol'):
+        env_type = 'mujoco'
+
     return env_type, env_id
 
 
 def get_default_network(env_type):
     if env_type in {'atari', 'retro'}:
-        return 'cnn'
+        return 'cnn_mlp'
     else:
-        return 'mlp'
+        return 'mlp_only'
 
 def get_alg_module(alg, submodule=None):
     submodule = submodule or alg

@@ -79,6 +79,13 @@ def set_global_seeds(i):
         tf.set_random_seed(myseed)
     except ImportError:
         pass
+
+    try:
+        import torch
+        torch.manual_seed(myseed)
+    except ImportError:
+        pass
+
     np.random.seed(myseed)
     random.seed(myseed)
 
